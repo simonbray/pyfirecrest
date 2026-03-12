@@ -20,7 +20,7 @@ from firecrest.FirecrestException import (
 
 __version__ = "3.6.0"
 __app_name__ = "firecrest"
-MIN_PYTHON_VERSION = (3, 7, 0)
+MIN_PYTHON_VERSION = (3, 6, 0)
 
 __all__ = [
     "v1",
