@@ -128,6 +128,17 @@ class AsyncExternalTransfer:
             await asyncio.sleep(i)
 
 
+def _get_wormhole_code(transfer_info: dict) -> str:
+    trans_dir = transfer_info.get("transferDirectives", {})
+    code = trans_dir.get("wormholeCode")
+    if not code:
+        raise MultipartUploadException(
+            transfer_info,
+            "Could not find wormhole code in transfer info"
+        )
+    return code
+
+
 class AsyncExternalUpload(AsyncExternalTransfer):
     def __init__(self, client, transfer_info, local_file):
         self._client = client
@@ -141,6 +152,36 @@ class AsyncExternalUpload(AsyncExternalTransfer):
     @property
     def transfer_data(self):
         return self._transfer_info
+
+    @property
+    def wormhole_code(self):
+        return self._transfer_info.get(
+            "transferDirectives", {}
+        ).get("wormholeCode")
+
+    async def send_file_wormhole(self):
+        if not isinstance(self._local_file, (str, pathlib.Path)):
+            raise ValueError(
+                "`local_file` must be a path when using wormhole."
+            )
+        code = _get_wormhole_code(self._transfer_info)
+        self._client.log(
+            logging.DEBUG,
+            "Starting wormhole send using external CLI."
+        )
+        process = await asyncio.create_subprocess_exec(
+            "wormhole",
+            "send",
+            str(self._local_file),
+            "--code",
+            code
+        )
+        rc = await process.wait()
+        if rc != 0:
+            raise MultipartUploadException(
+                self._transfer_info,
+                f"Wormhole send failed with exit code {rc}"
+            )
 
     async def upload_file_to_stage(self):
         urls = self._transfer_info.get("partsUploadUrls")
@@ -315,6 +356,37 @@ class AsyncExternalDownload(AsyncExternalTransfer):
     @property
     def transfer_data(self):
         return self._transfer_info
+
+    @property
+    def wormhole_code(self):
+        return self._transfer_info.get(
+            "transferDirectives", {}
+        ).get("wormholeCode")
+
+    async def receive_file_wormhole(self):
+        if not isinstance(self._file_path, (str, pathlib.Path)):
+            raise ValueError(
+                "`target_path` must be a path when using wormhole."
+            )
+        code = _get_wormhole_code(self._transfer_info)
+        self._client.log(
+            logging.DEBUG,
+            "Starting wormhole receive using external CLI."
+        )
+        process = await asyncio.create_subprocess_exec(
+            "wormhole",
+            "receive",
+            "--code",
+            code,
+            "-o",
+            str(self._file_path)
+        )
+        rc = await process.wait()
+        if rc != 0:
+            raise MultipartUploadException(
+                self._transfer_info,
+                f"Wormhole receive failed with exit code {rc}"
+            )
 
     async def download_file_from_stage(self, file_path=None):
         file_name = file_path or self._file_path
@@ -1474,7 +1546,7 @@ class AsyncFirecrest:
         filename: str,
         account: Optional[str] = None,
         blocking: bool = True,
-        transfer_method: str = "s3"
+        transfer_method: str = "wormhole"
     ) -> Optional[AsyncExternalUpload]:
         """Upload a file to the system. Small files will be
         uploaded directly to FirecREST and will be immediately available.
@@ -1497,13 +1569,16 @@ class AsyncFirecrest:
                          relevant when the file is larger than
                          `MAX_DIRECT_UPLOAD_SIZE`)
         :param transfer_method: the method to be used for the upload of large
-                                files. Supported methods: "s3", "streamer".
+                                files. Supported methods: "s3", "streamer",
+                                "wormhole".
         :calls: POST `/filesystem/{system_name}/transfer/upload`
         """
-        if transfer_method not in ["s3", "streamer"]:
+        data: dict[str, Any]
+
+        if transfer_method not in ["s3", "streamer", "wormhole"]:
             raise ValueError(
-                f"Unsupported transfer_method '{transfer_method}'. Only 's3' "
-                f"and 'streamer' are currently supported."
+                f"Unsupported transfer_method '{transfer_method}'. Only 's3', "
+                f"'streamer' and 'wormhole' are currently supported."
             )
 
         if not isinstance(local_file, (str, pathlib.Path)):
@@ -1541,6 +1616,92 @@ class AsyncFirecrest:
             f"stage area of FirecREST and then moved to the "
             f"target directory, since it's {local_file_size} bytes."
         )
+
+        if transfer_method == "wormhole":
+            if not blocking:
+                self.log(
+                    logging.WARNING,
+                    "For the wormhole upload `blocking=True` is mandatory."
+                )
+
+            # Generate wormhole code using external CLI
+
+            self.log(
+                logging.DEBUG,
+                "Will upload through wormhole."
+            )
+
+            wormhole_cmd = [
+                "wormhole",
+                "send",
+                str(local_file),
+                "--code-length",
+                "4"
+            ]
+            # Start wormhole process and capture code from stderr
+            wormhole_proc: Any = await asyncio.create_subprocess_exec(
+                *wormhole_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            wormhole_code = None
+            while True:
+                line = await wormhole_proc.stderr.readline()
+                if not line:
+                    break
+                decoded_line = line.decode().strip()
+                if "Wormhole code is:" in decoded_line:
+                    wormhole_code = decoded_line.split(":")[-1].strip()
+                    self.log(
+                        logging.DEBUG,
+                        f"Upload through wormhole: {wormhole_code}."
+                    )
+                    break
+
+            if not wormhole_code:
+                await wormhole_proc.wait()
+                stderr = await wormhole_proc.stderr.read()
+                raise MultipartUploadException(
+                    {},
+                    f"Failed to get wormhole code: {stderr.decode()}"
+                )
+
+            data = {
+                "path": os.path.join(directory, filename),
+                "transfer_directives": {
+                    "wormholeCode": wormhole_code,
+                    "transfer_method": transfer_method
+                }
+            }
+
+            if account is not None:
+                data["account"] = account
+
+            resp = await self._post_request(
+                endpoint=f"/filesystem/{system_name}/transfer/upload",
+                json_data=data
+            )
+
+            transfer_info = self._check_response(resp, 201)
+            ext_upload = AsyncExternalUpload(
+                client=self,
+                transfer_info=transfer_info,
+                local_file=local_file,
+            )
+
+            await ext_upload.wait_for_transfer_job()
+
+            # Wait for the wormhole command of upload to finish
+            rc = await wormhole_proc.wait()
+            if rc != 0:
+                raise MultipartUploadException(
+                    transfer_info,
+                    f"Wormhole send failed with exit code {rc}"
+                )
+
+            return ext_upload
+
         if self._api_version < parse("2.4.0"):
             data = {
                 "source_path": directory,
@@ -1608,7 +1769,7 @@ class AsyncFirecrest:
         target_path: str | pathlib.Path,
         account: Optional[str] = None,
         blocking: bool = True,
-        transfer_method: str = "s3"
+        transfer_method: str = "wormhole"
     ) -> Optional[AsyncExternalDownload]:
         """Download a file from the remote system.
 
@@ -1621,13 +1782,14 @@ class AsyncFirecrest:
                         `MAX_DIRECT_UPLOAD_SIZE`)
         :param blocking: whether to wait for the job to complete
         :param transfer_method: the method to be used for the download of large
-                                files. Supported methods: "s3", "streamer".
+                                files. Supported methods: "s3", "streamer",
+                                "wormhole".
         :calls: POST `/filesystem/{system_name}/transfer/download`
         """
-        if transfer_method not in ["s3", "streamer"]:
+        if transfer_method not in ["s3", "streamer", "wormhole"]:
             raise ValueError(
-                f"Unsupported transfer_method '{transfer_method}'. Only 's3' "
-                f"and 'streamer' are currently supported."
+                f"Unsupported transfer_method '{transfer_method}'. Only 's3', "
+                f"'streamer' and 'wormhole' are currently supported."
             )
 
         if not isinstance(target_path, (str, pathlib.Path)):
@@ -1684,7 +1846,7 @@ class AsyncFirecrest:
             data = {
                 "source_path": source_path,
                 "transfer_directives": {
-                    "transferMethod": "s3"
+                    "transferMethod": transfer_method
                 }
             }
 
@@ -1724,6 +1886,8 @@ class AsyncFirecrest:
             elif actual_transfer_method == "streamer":
                 await download_obj.wait_for_streamer_job_to_listen()
                 await download_obj.download_file_streamer()
+            elif actual_transfer_method == "wormhole":
+                await download_obj.receive_file_wormhole()
 
         return download_obj
 
