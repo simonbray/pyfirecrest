@@ -16,7 +16,6 @@ import pathlib
 import ssl
 
 from packaging.version import Version, parse
-from streamer import streamer_client as cli
 from typing import Any, Optional, List
 
 from firecrest.utilities import (
@@ -39,6 +38,11 @@ from firecrest.FirecrestException import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    from streamer import streamer_client as cli
+except ImportError:
+    logger.warning('firecrest-streamer is not installed. Some methods may fail.')
+    streamer = None
 
 # This function is temporarily here
 def handle_response(response):
